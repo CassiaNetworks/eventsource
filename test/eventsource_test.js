@@ -8,6 +8,7 @@ var fs = require('fs')
 var mocha = require('mocha')
 var assert = require('assert')
 var u = require('url')
+var net = require('net')
 
 var it = mocha.it
 var describe = mocha.describe
@@ -92,7 +93,7 @@ function createProxy (target, protocol, callback) {
       upstreamRes.pipe(res)
     })
 
-    proxied.push(upstreamReq)
+    proxied.push({req: upstreamReq, res: res})
     upstreamReq.end()
   })
 
@@ -100,8 +101,9 @@ function createProxy (target, protocol, callback) {
 
   var oldClose = server.close
   server.close = function (closeCb) {
-    proxied.forEach(function (res) {
-      res.abort()
+    proxied.forEach(function (pair) {
+      pair.req.abort()
+      pair.res.destroy()
     })
 
     oldClose.call(server, function () {
@@ -466,6 +468,26 @@ describe('Parser', function () {
       }
     })
   })
+
+  it('parses a relatively huge message across many chunks efficiently', function (done) {
+    this.timeout(1000)
+
+    createServer(function (err, server) {
+      if (err) return done(err)
+
+      var longMessageContent = new Array(100000).join('a')
+      var longMessage = 'data: ' + longMessageContent + '\n\n'
+      var longMessageChunks = longMessage.match(/[\s\S]{1,10}/g) // Split the message into chunks of 10 characters
+      server.on('request', writeEvents(longMessageChunks))
+
+      var es = new EventSource(server.url)
+
+      es.onmessage = function (m) {
+        assert.equal(longMessageContent, m.data)
+        server.close(done)
+      }
+    })
+  })
 })
 
 describe('HTTP Request', function () {
@@ -529,7 +551,7 @@ describe('HTTP Request', function () {
     })
   });
 
-  [301, 307].forEach(function (status) {
+  [301, 302, 307].forEach(function (status) {
     it('follows http ' + status + ' redirect', function (done) {
       var redirectSuffix = '/foobar'
       var clientRequestedRedirectUrl = false
@@ -599,6 +621,31 @@ describe('HTTP Request', function () {
       })
     })
   })
+
+  it('checks createConnection option', function (done) {
+    createServer(function (err, server) {
+      if (err) return done(err)
+
+      var testResult = false
+
+      server.on('request', function () {
+        assert.ok(testResult)
+        server.close(done)
+      })
+
+      var urlObj = u.parse(server.url)
+
+      new EventSource(server.url, {
+        createConnection: function () {
+          var connection = net.createConnection({ port: urlObj.port, host: urlObj.hostname })
+          connection.on('connect', function () {
+            testResult = true
+          })
+          return connection
+        }
+      })
+    })
+  })
 })
 
 describe('HTTPS Support', function () {
@@ -660,6 +707,34 @@ describe('Reconnection', function () {
           server.close(done)
         }
       })
+    }
+  })
+
+  it('continuing attempts when server is down', function (done) {
+    // Seems set reconnectInterval=0 not work here, this makes total time spent for current case more than 3S
+    this.timeout(4000)
+
+    var es = new EventSource('http://localhost:' + _port++)
+    es.reconnectInterval = 0
+    var reconnectCount = 0
+
+    es.onerror = function () {
+      reconnectCount++
+      // make sure client is keeping reconnecting
+      if (reconnectCount > 2) {
+        es.onerror = null
+        var port = u.parse(es.url).port
+        configureServer(http.createServer(), 'http', port, function (err, server) {
+          if (err) return done(err)
+
+          server.on('request', writeEvents(['data: hello\n\n']))
+
+          es.onmessage = function (m) {
+            assert.equal('hello', m.data)
+            server.close(done)
+          }
+        })
+      }
     }
   })
 
@@ -870,6 +945,36 @@ describe('Reconnection', function () {
             })
           })
         })
+      }
+    })
+  })
+
+  it('attempts to reconnect are deduplicated on sequential erorrs', function (done) {
+    createServer(function (err, server) {
+      if (err) return done(err)
+      var events = ['data: Hello']
+      var eventsSent = 0
+      var errorOccurred = false
+      server.on('request', function (req, res) {
+        if (eventsSent === 0) {
+          var fn = writeEvents(events)
+          fn(req, res)
+          eventsSent++
+          // now cause a few errors
+          fn(req, res)
+          eventsSent++
+        } else {
+          assert.equal(EventSource.CONNECTING, es.readyState)
+          assert.ok(errorOccurred)
+          server.close(done)
+        }
+      })
+
+      var es = new EventSource(server.url)
+      assert.equal(EventSource.CONNECTING, es.readyState)
+      es.reconnectInterval = 0
+      es.onerror = function (err) {
+        errorOccurred = !!(errorOccurred || err)
       }
     })
   })
